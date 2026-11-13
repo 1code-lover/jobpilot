@@ -180,6 +180,17 @@ describe("平台切换器", () => {
     await waitFor(() => expect(screen.getByRole("heading", { level: 1, name: "总览" })).toBeInTheDocument());
     expect(screen.queryByRole("navigation")).not.toBeInTheDocument();
   });
+
+  /** 验共用路由上点「进入工作区」直达该平台找工作页（采集入口所在）。 */
+  it("共用路由上点「进入工作区」直达找工作页", async () => {
+    renderAt("/overview");
+    await heading("总览");
+
+    await userEvent.click(screen.getByRole("button", { name: "进入工作区" }));
+
+    await heading("找工作");
+    expect(await screen.findByRole("navigation", { name: "BOSS直聘 导航" })).toBeInTheDocument();
+  });
 });
 
 /** 验 nav_extras 描述符驱动的标题解析。 */

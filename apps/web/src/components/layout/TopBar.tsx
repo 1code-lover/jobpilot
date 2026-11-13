@@ -20,13 +20,15 @@ export interface TopBarProps {
   activeSharedKey: string | null;
   onSelectPlatform: (siteId: string) => void;
   onSelectShared: (key: string) => void;
+  /** 进入平台工作区（找工作页）；共用路由上切平台只换上下文，靠这个入口跳过去 */
+  onEnterWorkspace?: () => void;
   /** 顶栏右侧额外内容（任务铃等） */
   rightSlot?: React.ReactNode;
 }
 
 /** 顶栏：平台切换器 + 真共用路由入口 + 主题开关（玻璃材质见 theme 根样式）。 */
 export function TopBar({
-  platforms, activeSiteId, activeSharedKey, onSelectPlatform, onSelectShared, rightSlot,
+  platforms, activeSiteId, activeSharedKey, onSelectPlatform, onSelectShared, onEnterWorkspace, rightSlot,
 }: TopBarProps) {
   const { mode, toggle } = useThemeMode();
   const [moreAnchor, setMoreAnchor] = useState<HTMLElement | null>(null);
@@ -94,6 +96,12 @@ export function TopBar({
             ))}
           </Menu>
         </>
+      )}
+
+      {onEnterWorkspace !== undefined && activeSiteId !== null && (
+        <Button variant="tinted" size="small" onClick={onEnterWorkspace}>
+          进入工作区
+        </Button>
       )}
 
       <Box sx={{ display: "flex", gap: 0.5, ml: 2, overflowX: "auto" }} className="scroll-edges-x">

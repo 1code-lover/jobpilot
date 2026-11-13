@@ -11,7 +11,7 @@ import { Box, Typography } from "@mui/material";
 import { Button, PageTransition, PlatformSidebar, ScrollArea, SessionSignal, TaskBadge, TopBar, pageRootSx } from "@/components";
 import { usePlatform } from "@/platform/PlatformProvider";
 import { byId } from "@/platform/registry";
-import { SHARED_NAV } from "@/platform/types";
+import { SHARED_NAV, PLATFORM_NAV } from "@/platform/types";
 import { routeSegmentForKey } from "@/routes/match";
 import { typeScale } from "@/theme/tokens";
 
@@ -45,6 +45,10 @@ export function ShellLayout() {
           const item = SHARED_NAV.find((n) => n.key === key);
           if (item) navigate(item.route);
         }}
+        onEnterWorkspace={activeSiteId ? () => {
+          const jobs = PLATFORM_NAV.find((n) => n.key === "jobs") ?? PLATFORM_NAV[0];
+          navigate(`/${activeSiteId}/${jobs.route}`);
+        } : undefined}
         rightSlot={
           <>
             <SessionSignal />
