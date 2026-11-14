@@ -176,9 +176,25 @@ describe("DeliverPage 清单与门槛", () => {
     expect(screen.getByText("你好，我对这个岗位很感兴趣。")).toBeInTheDocument();
   });
 
-  /** 悬浮匹配分展示岗位名、薪资与 JD。 */
-  it("悬浮匹配分容器给岗位名 / 薪资 / JD（提议「投递 2.1」）", async () => {
+  /** 已发送（冷却中）的岗位默认隐藏，可切回显示。 */
+  it("已发送的岗位默认隐藏，点「已隐藏已发送」可显示回来", async () => {
+    vi.stubGlobal("fetch", stubFetch({
+      matches: [
+        { ...ANALYSIS.matches[0], delivered_at: "2026-11-13 08:00:00", greet_in_cooldown: true },
+        ANALYSIS.matches[2],
+      ],
+    }));
     renderPage();
+
+    expect(await screen.findByText("测试工程师")).toBeInTheDocument();
+    expect(screen.queryByText("前端工程师")).not.toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole("button", { name: "已隐藏已发送" }));
+    expect(await screen.findByText("前端工程师")).toBeInTheDocument();
+  });
+
+  /** 悬浮匹配分展示岗位名、薪资与 JD。 */
+  it("悬浮匹配分容器给岗位名 / 薪资 / JD（提议「投递 2.1」）", async () => {    renderPage();
     await screen.findByText("前端工程师");
 
     await userEvent.hover(screen.getByRole("img", { name: /匹配 92 分/ }));

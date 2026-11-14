@@ -232,6 +232,8 @@ export function DeliverPage() {
   const [analysisId, setAnalysisId] = useState("");
   const [analysis, setAnalysis] = useState<AnalysisPayload | null>(null);
   const [selected, setSelected] = useState<Set<string>>(() => new Set());
+  /** 隐藏已发送（含 30 天冷却内）的岗位，默认开。 */
+  const [hideSent, setHideSent] = useState(true);
   const [minScore, setMinScore] = useState(70);
   const [limits, setLimits] = useState<DeliverLimits | null>(null);
   const [status, setStatus] = useState<DeliverStatus | null>(null);
@@ -412,6 +414,18 @@ export function DeliverPage() {
     [matches],
   );
 
+  /** 已发送的判定：冷却中 / 有发送时间 / 状态成功，三者任一即视为已发送。 */
+  const sentOf = useCallback(
+    (m: MatchRow) => m.greet_in_cooldown === true || Boolean(m.delivered_at) || m.deliver_status === "ok",
+    [],
+  );
+
+  const visibleRanked = useMemo(
+    () => (hideSent ? ranked.filter((m) => !sentOf(m)) : ranked),
+    [ranked, hideSent, sentOf],
+  );
+  const sentCount = ranked.length - ranked.filter((m) => !sentOf(m)).length;
+
   const excluded = matches.length - allTargets.length;
   const quotaLeft = limits?.quota_left;
   const quotaText = limits
@@ -500,9 +514,15 @@ export function DeliverPage() {
           <ScrollArea>
             <EmptyState title="还没有分析结果" />
           </ScrollArea>
-        ) : ranked.length === 0 ? (
+        ) : visibleRanked.length === 0 ? (
           <ScrollArea>
-            <EmptyState title="这次分析没有匹配结果" />
+            <EmptyState
+              title={ranked.length === 0 ? "这次分析没有匹配结果" : "没有待发送的岗位"}
+              description={ranked.length === 0 ? undefined : `已发送 ${sentCount} 条都已隐藏，点「显示已发送」可查看`}
+              action={ranked.length === 0 ? undefined : (
+                <Button size="small" variant="gray" onClick={() => setHideSent(false)}>显示已发送</Button>
+              )}
+            />
           </ScrollArea>
         ) : (
           <Surface sx={{ p: 0, flex: 1, minHeight: 0, display: "flex", flexDirection: "column", overflow: "hidden" }}>
@@ -511,19 +531,28 @@ export function DeliverPage() {
                 发送清单
               </Typography>
               <Typography sx={{ ...typeScale.xs, color: "text.secondary" }}>
-                共 {fmtNumber(ranked.length)} 条
+                共 {fmtNumber(visibleRanked.length)} 条{sentCount > 0 && !hideSent ? `（其中已发送 ${fmtNumber(sentCount)} 条）` : ""}
               </Typography>
+              {sentCount > 0 && (
+                <Button
+                  size="small"
+                  variant={hideSent ? "tinted" : "plain"}
+                  onClick={() => setHideSent((v) => !v)}
+                >
+                  {hideSent ? "已隐藏已发送" : "显示已发送"}
+                </Button>
+              )}
               <Button
                 size="small"
                 variant="plain"
-                onClick={() => setSelected(new Set(ranked.filter((m) => m.greet_in_cooldown !== true).map((m) => m.encrypt_job_id)))}
+                onClick={() => setSelected(new Set(visibleRanked.filter((m) => m.greet_in_cooldown !== true).map((m) => m.encrypt_job_id)))}
               >
                 全选
               </Button>
               <Button size="small" variant="plain" onClick={() => setSelected(new Set())}>清空</Button>
             </Box>
             <ScrollArea sx={{ p: 0 }}>
-            {ranked.map((m) => {
+            {visibleRanked.map((m) => {
               const jid = m.encrypt_job_id;
               const cool = m.greet_in_cooldown === true;
               const r = restriction(m);
