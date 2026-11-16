@@ -1,5 +1,7 @@
 """后台抓取任务：线程跑 `JobClient.crawl`，网页轮询进度。
 
+搜索流的关键词格支持多条（逗号/顿号/分号/换行分隔）：拆开后按关键词逐个
+串行跑一轮 `crawl`，进度与事件合并在同一个任务卡里；期望流不看关键词。
 除了内存里的「当前任务」，每次 `start()` 还会落一行 `crawl_tasks` 档案。
 落库失败不中断抓取，详见 `notes/jobpilot_server/services/crawl_task.md`。
 
@@ -11,18 +13,21 @@ Attributes:
     PHASE_TEXT: `CrawlTask.phase` 内部阶段代号 → 人话（任务中心「当前」列、页面小标共用）。
     SITE: 本模块服务的站点；任务中心按站点记账、`crawl_tasks.site` 也用它。
     BLANK_SEARCH_MSG: 搜索流条件全空时的报错。
+    MAX_KEYWORDS: 单次采集最多跑几个关键词（防手滑把格子当文章填）。
 """
 
 from __future__ import annotations
 
 import logging
+import re
 import threading
 import time
 import uuid
 from collections import deque
+from dataclasses import replace
 from typing import Any, Mapping
 
-from jobpilot_platform_boss.jobs import CrawlBlacklistContext, create_client
+from jobpilot_platform_boss.jobs import CrawlBlacklistContext, CrawlReport, create_client
 from jobpilot_platform_boss.jobs.store import JobStore
 
 from .. import config as C
@@ -63,6 +68,29 @@ hub.register(
 BLANK_SEARCH_MSG = (
     "采集条件是空的：到「系统配置 → 采集配置」填关键词或筛选维度，或改用求职期望"
 )
+
+MAX_KEYWORDS = 10
+
+_KEYWORD_SEP_RE = re.compile(r"[,，、;；\n]+")
+
+
+def split_keywords(raw: str) -> list[str]:
+    """把一格关键词拆成多条：中英文逗号/顿号/分号/换行都算分隔。
+
+    去空、去重（保序），最多取 `MAX_KEYWORDS` 条；全空输入回空列表。
+
+    Args:
+        raw: 关键词格里的原文（如 `后端开发，AI应用,Python`）。
+
+    Returns:
+        关键词列表。
+    """
+    seen: dict[str, None] = {}
+    for token in _KEYWORD_SEP_RE.split(str(raw or "")):
+        kw = token.strip()
+        if kw:
+            seen.setdefault(kw, None)
+    return list(seen)[:MAX_KEYWORDS]
 
 
 def _search_filter_from(
@@ -196,6 +224,22 @@ def _progress_with_archive(task: "CrawlTask"):
     return _on_progress
 
 
+def _sum_reports(reports: list["CrawlReport"]) -> dict[str, int]:
+    """把多轮 `crawl` 的统计按键求和（单轮/空列表也照走，空轮全 0）。
+
+    Args:
+        reports: 各关键词跑出来的报告。
+
+    Returns:
+        合并后的统计字典。
+    """
+    keys = ("company_hits", "jd_hits", "skipped", "inserted", "updated")
+    return {
+        key: sum(int(getattr(report.stats, key, 0) or 0) for report in reports)
+        for key in keys
+    }
+
+
 class CrawlTask:
     """内存里的抓取任务状态与事件流水。
 
@@ -204,6 +248,9 @@ class CrawlTask:
         phase: 当前阶段。
         stopped_reason: 停止原因。
         progress: 累计进度计数。
+        keyword: 正在跑的关键词（多关键词时任务卡「当前」列展示）。
+        keyword_index: 当前是第几个关键词（1 起，0 = 还没开跑/单关键词）。
+        keyword_total: 关键词总数（搜索流；期望流恒 1）。
     """
 
     def __init__(self, params: dict[str, Any], *, site: str = "") -> None:
@@ -222,6 +269,9 @@ class CrawlTask:
         self.ended_at: float | None = None
         self.error: str | None = None
         self.stopped_reason = ""
+        self.keyword = ""
+        self.keyword_index = 0
+        self.keyword_total = 0
         self.progress: dict[str, Any] = {
             "pages": 0,
             "raw_count": 0,
@@ -278,20 +328,26 @@ class CrawlTask:
         """当前状态副本。
 
         `current` / `done` / `total` 是任务中心卡片直接读的三件套：阶段给
-        人话，进度按页数算（详情补抓阶段页数已满，进度条停在 100% 继续跑）。
+        人话，进度按页数算（详情补抓阶段页数已满，进度条停在 100% 继续跑）；
+        多关键词时 `total` 是「每词页数 × 词数」，`current` 带上跑到第几个词。
 
         Returns:
             含 task_id / status / current / done / total / progress / 最近事件的 dict。
         """
         with self.lock:
+            current = PHASE_TEXT.get(self.phase, self.phase)
+            if self.phase == "crawl" and self.keyword_total > 1 and self.keyword:
+                current = f"{current} · 关键词 {self.keyword_index}/{self.keyword_total}「{self.keyword}」"
+            keywords = self.params.get("keywords") or []
+            total = int(self.params.get("max_pages") or 0) * max(1, len(keywords))
             return {
                 "task_id": self.task_id,
                 "site": self.site,
                 "status": self.status,
                 "phase": self.phase,
-                "current": PHASE_TEXT.get(self.phase, self.phase),
+                "current": current,
                 "done": int(self.progress.get("pages") or 0),
-                "total": int(self.params.get("max_pages") or 0),
+                "total": total,
                 "params": self.params,
                 "created_at": self.created_at,
                 "ended_at": self.ended_at,
@@ -377,6 +433,8 @@ class CrawlTaskManager:
             "fetch_details": bool(saved["fetch_details"] if fetch_details is None else fetch_details),
             "detail_interval": float(saved["detail_interval"] if detail_interval is None else detail_interval),
             "store_blacklisted": bool(saved["store_blacklisted"] if store_blacklisted is None else store_blacklisted),
+            # 搜索流按关键词逐个串行跑；期望流不认关键词，空列表也不碍事
+            "keywords": split_keywords(str(config_snapshot.search.get("query") or "")),
             "config_snapshot": config_snapshot.to_dict(),
         }
         if not str(saved.get("expect_kind") or "").strip():
@@ -482,6 +540,11 @@ class CrawlTaskManager:
                 if search_filter.is_blank:
                     raise ValueError(BLANK_SEARCH_MSG)
 
+            keywords = list(params.get("keywords") or [])
+            if expect_filter is None and not keywords:
+                keywords = [""]  # 没填关键词但筛了维度：按无关键词跑一轮
+            task.keyword_total = 1 if expect_filter is not None else len(keywords)
+
             task.phase = "stoken"
             task.push({"event": "stoken", "message": "正在准备搜索令牌（可能拉起 Chrome）…"})
 
@@ -529,31 +592,71 @@ class CrawlTaskManager:
                 jd_matches=jd_matches,
                 record_hit=record_hit,
             )
+            reports: list[CrawlReport] = []
+            failed_keywords: list[str] = []
+            last_error: Exception | None = None
             try:
-                report = client.crawl(
-                    store=store,
-                    max_pages=int(params["max_pages"]),
-                    start_page=int(params["start_page"]),
-                    search_filter=search_filter,
-                    expect_filter=expect_filter,
-                    on_progress=_progress_with_archive(task),
-                    should_stop=lambda: task.cancel_flag,
-                    enrich_details=bool(params.get("fetch_details", True)),
-                    detail_interval=float(params.get("detail_interval", 1.0)),
-                    blacklist_context=context,
-                    task_id=task.task_id,
-                )
+                for index, kw in enumerate(keywords, start=1):
+                    if task.cancel_flag:
+                        break
+                    task.keyword = kw
+                    task.keyword_index = index
+                    if task.keyword_total > 1:
+                        task.push({
+                            "event": "keyword_start", "keyword": kw,
+                            "index": index, "total": task.keyword_total,
+                        })
+                    kw_filter = (
+                        replace(search_filter, query=kw) if search_filter is not None else None
+                    )
+                    try:
+                        reports.append(client.crawl(
+                            store=store,
+                            max_pages=int(params["max_pages"]),
+                            start_page=int(params["start_page"]),
+                            search_filter=kw_filter,
+                            expect_filter=expect_filter,
+                            on_progress=_progress_with_archive(task),
+                            should_stop=lambda: task.cancel_flag,
+                            enrich_details=bool(params.get("fetch_details", True)),
+                            detail_interval=float(params.get("detail_interval", 1.0)),
+                            blacklist_context=context,
+                            task_id=task.task_id,
+                        ))
+                    except Exception as exc:  # noqa: BLE001 - 单词失败记一笔继续跑下一个
+                        last_error = exc
+                        failed_keywords.append(kw)
+                        logger.warning("抓取任务 %s 关键词「%s」失败", task.task_id, kw, exc_info=True)
+                        task.push({
+                            "event": "keyword_error", "keyword": kw, "index": index,
+                            "message": humanize(exc),
+                        })
+                        continue
+                    if task.keyword_total > 1:
+                        done = reports[-1]
+                        task.push({
+                            "event": "keyword_done", "keyword": kw, "index": index,
+                            "inserted": done.stats.inserted, "updated": done.stats.updated,
+                        })
             finally:
                 store.close()
 
+            if not reports and last_error is not None:
+                raise last_error
+
             with task.lock:
-                task.stopped_reason = report.stats.stopped_reason
+                if task.cancel_flag:
+                    task.stopped_reason = "收到停止信号"
+                elif reports:
+                    task.stopped_reason = reports[-1].stats.stopped_reason
                 task.status = ST_CANCELLED if task.cancel_flag else ST_DONE
                 task.ended_at = time.time()
-            task.push({"event": "finished", "stopped_reason": report.stats.stopped_reason,
-                       "company_hits": report.stats.company_hits, "jd_hits": report.stats.jd_hits,
-                       "skipped": report.stats.skipped, "inserted": report.stats.inserted,
-                       "updated": report.stats.updated})
+            stats = _sum_reports(reports)
+            task.push({"event": "finished", "stopped_reason": task.stopped_reason,
+                       "company_hits": stats["company_hits"], "jd_hits": stats["jd_hits"],
+                       "skipped": stats["skipped"], "inserted": stats["inserted"],
+                       "updated": stats["updated"], "keywords": task.keyword_total,
+                       "keyword_failed": len(failed_keywords)})
             _archive_finish(task, status=task.status)
         except Exception as exc:  # noqa: BLE001 - 线程里兜住，状态给前端
             logger.exception("抓取任务 %s 失败", task.task_id)

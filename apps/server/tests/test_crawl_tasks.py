@@ -8,6 +8,9 @@ import pytest
 from fastapi.testclient import TestClient
 
 import jobpilot_db
+from jobpilot_platform_boss.catalog import save_search_filter
+from jobpilot_platform_boss.catalog.search import JobSearchFilter
+from jobpilot_platform_boss.jobs import CrawlReport, CrawlStats
 from jobpilot_platform_boss.jobs.models import Job, PageResult
 from jobpilot_platform_boss.jobs.store import DEFAULT_SITE, JobStore
 from jobpilot_server import create_app
@@ -29,6 +32,16 @@ def _task_site(task_id: str) -> str:
 def client():
     """提供指向假服务端的登录客户端。"""
     return TestClient(create_app())
+
+
+@pytest.fixture(autouse=True)
+def reset_crawl_manager():
+    """抓取管理器是进程内单例：用例前后清掉残留任务，别让跨文件的 idle 判断串场。"""
+    from jobpilot_server.services import crawl_task as ct
+
+    ct.crawl_tasks._task = None
+    yield
+    ct.crawl_tasks._task = None
 
 
 def make_job(encrypt_job_id: str = "id-1", **overrides) -> Job:
@@ -423,3 +436,161 @@ def test_api_站点口批次详情照样可读(client: TestClient):
     with JobStore() as store:
         store.create_crawl_task("tk_51", site="51job")
     assert client.get("/api/sites/boss/crawl/tasks/tk_51").status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# 多关键词采集：拆分、串行、进度合并
+# ---------------------------------------------------------------------------
+
+
+def test_split_keywords_分隔去重封顶():
+    """中英文逗号/顿号/分号/换行都拆；去空去重保序，最多 10 条。"""
+    from jobpilot_server.services.crawl_task import MAX_KEYWORDS, split_keywords
+
+    assert split_keywords("后端开发，AI应用,Python、全栈") == ["后端开发", "AI应用", "Python", "全栈"]
+    assert split_keywords("a,,b\nc；；a") == ["a", "b", "c"]
+    assert split_keywords("  ") == []
+    assert split_keywords("") == []
+    many = [str(i) for i in range(15)]
+    assert split_keywords(",".join(many)) == many[:MAX_KEYWORDS]
+
+
+class _StubCrawlClient:
+    """桩客户端：记录每轮 crawl 的关键词，按序回固定统计。"""
+
+    def __init__(self, inserts: list[int]) -> None:
+        self.queries: list[str] = []
+        self._inserts = inserts
+
+    def crawl(self, **kwargs):
+        """记关键词并回一份报告。"""
+        self.queries.append(str(kwargs["search_filter"].query))
+        index = min(len(self.queries) - 1, len(self._inserts) - 1) if self._inserts else 0
+        return CrawlReport(
+            stats=CrawlStats(
+                run_id=f"r{len(self.queries)}",
+                inserted=self._inserts[index] if self._inserts else 0,
+                stopped_reason="达到 max_pages=2",
+            )
+        )
+
+
+def _wait_crawl_done(timeout: float = 10.0) -> dict:
+    """轮询到当前抓取任务离开 running 态，回快照。"""
+    from jobpilot_server.services.crawl_task import crawl_tasks
+
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        snap = crawl_tasks.snapshot()
+        if snap["status"] != "running":
+            return snap
+        time.sleep(0.05)
+    raise AssertionError("抓取任务未在超时内结束")
+
+
+def test_多关键词_逐词串行(monkeypatch):
+    """关键词格拆成多条后按序串行跑，进度/事件/统计合并进一个任务卡。"""
+    from jobpilot_server.services import crawl_task as ct
+
+    save_search_filter(JobSearchFilter(query="后端开发, AI应用，Python"))
+    stub = _StubCrawlClient(inserts=[3, 5, 0])
+    monkeypatch.setattr(ct, "create_client", lambda *a, **k: stub)
+
+    task = ct.crawl_tasks.start()
+    assert task.params["keywords"] == ["后端开发", "AI应用", "Python"]
+
+    snap = _wait_crawl_done()
+    assert snap["status"] == "done"
+    assert stub.queries == ["后端开发", "AI应用", "Python"]
+    # 三轮合成一张卡：总页数预算 = 每词页数 × 词数
+    assert snap["total"] == snap["params"]["max_pages"] * 3
+    kinds = [e["event"] for e in snap["events"]]
+    assert kinds.count("keyword_start") == 3
+    assert kinds.count("keyword_done") == 3
+    finished = next(e for e in snap["events"] if e["event"] == "finished")
+    assert finished["inserted"] == 8
+    assert finished["keywords"] == 3
+    assert finished["keyword_failed"] == 0
+
+
+def test_单关键词_不发keyword事件(monkeypatch):
+    """只有一个词时不发 keyword_start/done，行为跟旧版一致。"""
+    from jobpilot_server.services import crawl_task as ct
+
+    save_search_filter(JobSearchFilter(query="后端开发"))
+    stub = _StubCrawlClient(inserts=[3])
+    monkeypatch.setattr(ct, "create_client", lambda *a, **k: stub)
+
+    ct.crawl_tasks.start()
+    snap = _wait_crawl_done()
+    assert snap["status"] == "done"
+    assert stub.queries == ["后端开发"]
+    kinds = [e["event"] for e in snap["events"]]
+    assert "keyword_start" not in kinds
+    assert "keyword_done" not in kinds
+    assert snap["total"] == snap["params"]["max_pages"]
+
+
+def test_没关键词只筛维度_跑一轮(monkeypatch):
+    """没填关键词但筛了城市：按无关键词跑一轮，不报空条件。"""
+    from jobpilot_server.services import crawl_task as ct
+
+    save_search_filter(JobSearchFilter(city="101280100"))
+    stub = _StubCrawlClient(inserts=[0])
+    monkeypatch.setattr(ct, "create_client", lambda *a, **k: stub)
+
+    ct.crawl_tasks.start()
+    snap = _wait_crawl_done()
+    assert snap["status"] == "done"
+    assert stub.queries == [""]
+
+
+def test_单词失败_继续跑下一个(monkeypatch):
+    """第一个词 crawl 抛错：记 keyword_error，后续词照跑，任务整体仍算完成。"""
+
+    class FlakyClient:
+        """桩客户端：第一轮抛错。"""
+
+        def __init__(self) -> None:
+            self.queries: list[str] = []
+
+        def crawl(self, **kwargs):
+            """第一轮抛 RuntimeError，其余照常。"""
+            self.queries.append(str(kwargs["search_filter"].query))
+            if len(self.queries) == 1:
+                raise RuntimeError("上游炸了")
+            return CrawlReport(stats=CrawlStats(run_id=f"r{len(self.queries)}", stopped_reason="达到 max_pages=2"))
+
+    from jobpilot_server.services import crawl_task as ct
+
+    save_search_filter(JobSearchFilter(query="后端开发,Python"))
+    stub = FlakyClient()
+    monkeypatch.setattr(ct, "create_client", lambda *a, **k: stub)
+
+    ct.crawl_tasks.start()
+    snap = _wait_crawl_done()
+    assert snap["status"] == "done"
+    assert stub.queries == ["后端开发", "Python"]
+    kinds = [e["event"] for e in snap["events"]]
+    assert kinds.count("keyword_error") == 1
+    finished = next(e for e in snap["events"] if e["event"] == "finished")
+    assert finished["keyword_failed"] == 1
+
+
+def test_全部失败_任务报错(monkeypatch):
+    """每个词都抛错：任务整体判失败，错误转成事件。"""
+    from jobpilot_server.services import crawl_task as ct
+
+    class BoomClient:
+        """桩客户端：一律抛错。"""
+
+        def crawl(self, **kwargs):
+            """抛 RuntimeError。"""
+            raise RuntimeError("上游炸了")
+
+    save_search_filter(JobSearchFilter(query="后端开发,Python"))
+    monkeypatch.setattr(ct, "create_client", lambda *a, **k: BoomClient())
+
+    ct.crawl_tasks.start()
+    snap = _wait_crawl_done()
+    assert snap["status"] == "error"

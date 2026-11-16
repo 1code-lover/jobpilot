@@ -49,6 +49,25 @@ export function labelLookup(conditions: FilterConditions | null | undefined): La
 /** 期望流形态（`CollectionParams.expect_kind`）。 */
 export type ExpectKind = "" | "expect" | "recommend" | "part_time" | "temp_expect";
 
+/** 单次采集最多跑几个关键词（与后端 `crawl_task.MAX_KEYWORDS` 同值）。 */
+export const MAX_KEYWORDS = 10;
+
+/** 关键词分隔符：中英文逗号/顿号/分号/换行（与后端 `split_keywords` 同规则）。 */
+const KEYWORD_SEP_RE = /[,，、;；\n]+/;
+
+/**
+ * 把一格关键词拆成多条：按分隔符切开、去空、去重（保序），最多 `MAX_KEYWORDS` 条。
+ * 保存时仍以逗号串存进 `search.query`，拆分规则前后端保持一致。
+ */
+export function parseKeywords(raw: string | undefined | null, limit = MAX_KEYWORDS): string[] {
+  const seen: string[] = [];
+  for (const token of String(raw ?? "").split(KEYWORD_SEP_RE)) {
+    const kw = token.trim();
+    if (kw && !seen.includes(kw)) seen.push(kw);
+  }
+  return seen.slice(0, limit);
+}
+
 /** 采集配置两块（GET 载荷）。 */
 export interface CollectionConfig {
   search: SearchFilterPayload;
@@ -149,7 +168,14 @@ export function collectionSummary(data: CollectionConfig, lookup?: LabelLookup):
   const expectMode = !!kind;
   const partTime = kind === "part_time";
   const parts: string[] = [];
-  if (search.query && !expectMode) parts.push(`关键词「${search.query}」`);
+  if (search.query && !expectMode) {
+    const kws = parseKeywords(search.query);
+    parts.push(
+      kws.length > 1
+        ? `关键词 ${kws.length} 个「${kws.join("、")}」`
+        : `关键词「${kws[0] ?? search.query}」`,
+    );
+  }
   if (search.city) parts.push(`城市 ${t("city", search.city)}`);
   if (search.jobType && !expectMode) parts.push(`职位类型 ${t("jobType", search.jobType)}`);
   if (search.salary && !partTime) parts.push(`薪资 ${t("salary", search.salary)}`);

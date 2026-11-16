@@ -13,7 +13,7 @@ import { fmtTime } from "@/utils/format";
 import { filtersApi, type FilterConditions, type FilterOption, type ExpectRow } from "@/api/platform";
 import { useExpectStore } from "@/stores/expectStore";
 import {
-  choiceKeyOf, emptyCollectionConfig, expectChoices, toSaveBody,
+  choiceKeyOf, emptyCollectionConfig, expectChoices, MAX_KEYWORDS, parseKeywords, toSaveBody,
   type CollectionConfig, type ExpectKind,
 } from "@/views/platform/jobs/collection";
 
@@ -72,6 +72,28 @@ function ParamRow({
         onChange={onChange}
         sx={{ width: 110 }}
       />
+    </Box>
+  );
+}
+
+/** 一枚可删关键词：胶囊 + ✕（点掉即从格子里移除这一个词）。 */
+function KeywordChip({ label, onRemove }: { label: string; onRemove: () => void }) {
+  return (
+    <Box sx={{ display: "inline-flex", alignItems: "center", gap: 0.25 }}>
+      <Pill tone="static">{label}</Pill>
+      <Box
+        component="button"
+        type="button"
+        aria-label={`删除关键词 ${label}`}
+        onClick={onRemove}
+        sx={{
+          border: 0, bgcolor: "transparent", cursor: "pointer", p: 0.25,
+          color: "text.secondary", ...typeScale.xs,
+          "&:hover": { color: "error.main" },
+        }}
+      >
+        ✕
+      </Box>
     </Box>
   );
 }
@@ -138,6 +160,17 @@ export function CollectionSheet({ site, caps, open, onClose, value, onSaved }: C
   const patchCollection = useCallback((patch: Partial<CollectionConfig["collection"]>) => {
     setDraft((d) => ({ ...d, collection: { ...d.collection, ...patch } }));
   }, []);
+
+  /** 关键词格按分隔符实时拆分（保存仍存逗号串）；超出上限的词预览里不出现。 */
+  const keywords = useMemo(() => parseKeywords(draft.search.query), [draft.search.query]);
+  const keywordOverflow = useMemo(
+    () => parseKeywords(draft.search.query, 999).length - MAX_KEYWORDS,
+    [draft.search.query],
+  );
+  /** 删一枚关键词 = 把剩下的词重新用逗号拼回格子。 */
+  const removeKeyword = useCallback((kw: string) => {
+    patchSearch({ query: keywords.filter((k) => k !== kw).join(",") });
+  }, [keywords, patchSearch]);
 
   /** 选中某个期望 → 回填 kind / id / 展示名。 */
   const applyChoice = useCallback((key: string) => {
@@ -315,7 +348,23 @@ export function CollectionSheet({ site, caps, open, onClose, value, onSaved }: C
               onChange={(e) => patchSearch({ query: e.target.value })}
               disabled={off("keyword")}
               fullWidth
+              helperText="可填多个：用逗号、顿号或换行分隔，每个关键词各跑一轮采集"
             />
+            {keywords.length > 1 && (
+              <Box sx={{ display: "flex", flexWrap: "wrap", gap: 0.75, alignItems: "center" }}>
+                <Typography sx={{ ...typeScale.xs, color: "text.secondary" }}>
+                  共 {keywords.length} 个关键词，将串行采集 {keywords.length} 轮：
+                </Typography>
+                {keywords.map((kw) => (
+                  <KeywordChip key={kw} label={kw} onRemove={() => removeKeyword(kw)} />
+                ))}
+              </Box>
+            )}
+            {keywordOverflow > 0 && (
+              <Typography sx={{ ...typeScale.xs, color: "warning.main" }}>
+                关键词最多 {MAX_KEYWORDS} 个，多出的 {keywordOverflow} 个不会采集。
+              </Typography>
+            )}
             <Cascader
               label={DIM_LABEL.city}
               nodes={conditions?.cities ?? []}
